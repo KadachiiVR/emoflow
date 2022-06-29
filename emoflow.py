@@ -13,6 +13,7 @@ import yaml
 import librosa                                        # Python package for music and audio analysis
 import librosa.display                                # Allows you to display audio files 
 import os                                             # The OS module in Python provides a way of using operating system dependent functionality.
+import noisereduce as nr
 #import scipy.io.wavfile                               # Open a WAV files
                           # Used for working with arrays
 import fastai
@@ -161,8 +162,12 @@ def train(args):
                 #print(f"processing clip {idx} of {config['sample_count']}")
 
                 y = random_clip(all_audio, sr, config['sample_len'])
+                ynr = nr.reduce_noise(y=y, sr=sr, stationary=True, prop_decrease=0.9)
 
-                yt, _ = librosa.effects.trim(y)
+                #yt, _ = librosa.effects.trim(ynr)
+                yt = ynr
+                if (label == "silence"):
+                    yt = ynr
 
                 if idx % 8 == 0:
                     imgpath = os.path.join(test_bucket, "{}{}.jpg".format(label, str(idx).zfill(6)))
@@ -175,20 +180,25 @@ def train(args):
             print("done", label)
         print("generated spectrograms!")
 
-    dls = ImageDataLoaders.from_folder(SPECTROGRAM_DIR_TRAIN, valid_pct=0.2, seed=42, num_workers=6)
+    dls = ImageDataLoaders.from_folder(SPECTROGRAM_DIR_TRAIN, valid_pct=0.2, seed=42, num_workers=1, bs=32)
     print(dls.vocab.o2i)
+    #import pdb; pdb.set_trace()
     learn = vision_learner(
         dls,
         models.resnet34,
+        normalize=False,
         loss_func=CrossEntropyLossFlat(),
+        #loss_func=LabelSmoothingCrossEntropyFlat(),
         metrics=accuracy,
         path=config['model_path'],
-        model_dir=os.path.split(config['model_path'])[0]
+        model_dir=config['model_dir']
     )
 
     print("LEARNING!")
+    #x = learn.lr_find(num_it=50, stop_div=False, end_lr=4)
     x = learn.lr_find()
     lr = x.valley
+    print(f"+++ picking LR of {lr}")
     lfr = learn.fit(10, float(f"{lr:.2e}"))
     learn.show_results()
 
@@ -199,16 +209,22 @@ def train(args):
 
     plt.show()
     learn.freeze()
-    learn.export(config['model_path'])
+    try:
+        learn.export(config['model_export_path'])
+    except Exception as e:
+        print(e)
+        import pdb; pdb.set_trace()
 
 
-DEFAULT_EMOTES = {"neutral": 1, "excited": 0, "sad": 0}
+DEFAULT_EMOTES = {"neutral": 0, "excited": 0, "sad": 0, "laugh": 0, "silence": 1}
 
 
 def wav2imgdata(wav: File):
     with SimpleTimer("- processing"):
         y, sr = librosa.load(wav)
-        yt,_=librosa.effects.trim(y)
+        #yt,_=librosa.effects.trim(y)
+        with SimpleTimer("-- noise reduction"):
+            yt = nr.reduce_noise(y=y, sr=sr, stationary=True, prop_decrease=0.9)
 
         # Converting the sound clips into a melspectogram with librosa
         # A mel spectrogram is a spectrogram where the frequencies are converted to the mel scale
@@ -270,14 +286,62 @@ def interpret_scores(window, weights, weight, db, emotes):
     else:
         return NEUTRAL
 
+def interpret_scores_2(window, weights, weight, db, emotes):
+    sum_weights = sum(list(weights))
+    print(sum_weights)
 
+    smooth_emotes = {
+        k: sum([
+            d[k] * w
+            for d, w
+            in zip(list(window), list(weights))
+        ]) / (sum_weights + 5)
+        for k
+        in emotes.keys()
+    }
+    for k, v in sorted(emotes.items()):
+        print("%s: %.3f | %.3f" % (k, v, (smooth_emotes[k])))
+    print(weight, sum_weights, db)
 
+    highest = max(smooth_emotes, key=smooth_emotes.get)
 
+    NEUTRAL = 0
+    EXCITED = 1
+    SAD = 2
+    LAUGH = 3
+    REVERSE = {
+        NEUTRAL: "NEUTRAL",
+        EXCITED: "EXCITED",
+        SAD: "SAD",
+        LAUGH: "LAUGH"
+    }
+
+    if sum_weights < 5 or weight < 0.1:
+        return NEUTRAL, 1.0
+    elif highest == "silence":
+        return NEUTRAL, 1.0
+    elif highest == "excited":
+        return EXCITED, 1.0
+    elif smooth_emotes["laugh"] > 0.75 or (smooth_emotes["laugh"] > .3 and emotes["laugh"] > .9):
+        return LAUGH, weight / 2
+    elif smooth_emotes["sad"] > 0.85:
+        return SAD, 1.0
+    elif smooth_emotes["excited"] > .3:
+        return EXCITED, 1.0
+    else:
+        return NEUTRAL, 1.0
+
+REVERSE = {
+    0: "NEUTRAL",
+    1: "EXCITED",
+    2: "SAD",
+    3: "LAUGH"
+}
 
 def run(args):
     config = read_config(args.config)
     catsdir = os.path.join(config['tmp'], 'spectrograms_train')
-    dls = ImageDataLoaders.from_folder(catsdir, valid_pct=0.2, seed=42, num_workers=0)
+    dls = ImageDataLoaders.from_folder(catsdir, valid_pct=0.2, seed=42, num_workers=0, bs=32)
     print(dls.vocab.o2i)
     print(dls.vocab)
     model = vision_learner(
@@ -286,9 +350,9 @@ def run(args):
         loss_func=CrossEntropyLossFlat(),
         metrics=accuracy,
         path=config['model_path'],
-        model_dir=os.path.split(config['model_path'])[0]
+        model_dir=config['model_dir']
     )
-    #model.load(config['model_path'])
+    #model.load(config['model_export_path'])
 
     print("Model loaded")
 
@@ -352,12 +416,15 @@ def run(args):
             # print(weights)
             # print(smooth_emotes)
 
-            result = interpret_scores(window, weights, weight, db, emotes)
+            emotion, emotion_weight = interpret_scores_2(window, weights, weight, db, emotes)
+            print(f"Sending Emotion: {emotion} ({REVERSE[emotion]}), Weight: {emotion_weight}")
+            osc.send_message(f"{config['paramprefix']}Emotion", emotion)
+            osc.send_message(f"{config['paramprefix']}EmotionWeight", emotion_weight)
 
-            with SimpleTimer("- transmitting"):
-                for k, v in result.items():
-                    print(f"sending {k} = {v}")
-                    osc.send_message(f"{config['paramprefix']}{k}", v)
+            # with SimpleTimer("- transmitting"):
+            #     for k, v in result.items():
+            #         print(f"sending {k} = {v}")
+            #         osc.send_message(f"{config['paramprefix']}{k}", v)
 
 
             continue
