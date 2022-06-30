@@ -178,7 +178,7 @@ def train(args):
             print("done", label)
         print("generated spectrograms!")
 
-    dls = ImageDataLoaders.from_folder(SPECTROGRAM_DIR_TRAIN, valid_pct=0.2, seed=42, num_workers=6, bs=16)
+    dls = ImageDataLoaders.from_folder(SPECTROGRAM_DIR_TRAIN, valid_pct=0.2, seed=42, num_workers=1, bs=16)
     print(dls.vocab.o2i)
     learn = vision_learner(
         dls,
@@ -337,7 +337,7 @@ def interpret_scores(window, weights, weight, db, emotes):
 def run(args):
     config = read_config(args.config)
     catsdir = os.path.join(config['tmp'], 'spectrograms_train')
-    dls = ImageDataLoaders.from_folder(catsdir, valid_pct=0.2, seed=42, num_workers=0, bs=16)
+    dls = ImageDataLoaders.from_folder(catsdir, valid_pct=0.2, seed=42, num_workers=1, bs=16)
     print(dls.vocab.o2i)
     print(dls.vocab)
     model = vision_learner(
