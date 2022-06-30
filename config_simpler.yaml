@@ -1,0 +1,16 @@
+model_path: "models/happylaugh"
+model_dir: "models/happylaugh_dir"
+model_export_path: "models/happylaugh.emfmodel"
+labels:
+  0: "neutral"
+  1: "excited"
+  2: "laugh"
+sample_count: 500
+sample_len: 1.5
+random_seed: "amogus"
+dataset: "./dataset_simplified/"
+tmp: "./tmp/"
+paramprefix: "/avatar/parameters/EmoFlow/"
+fs: 44100
+window: 5
+noise_reduction: 0.6

@@ -43,6 +43,7 @@ import argparse
 import soundfile as sf
 import io
 from pythonosc.udp_client import SimpleUDPClient as Osc
+import noisereduce as nr
 from enum import Enum
 from collections import deque
 
@@ -158,32 +159,35 @@ def train(args):
                     all_audio = np.append(all_audio, y)
 
             for idx in tqdm(range(config['sample_count'])):
-                #print(f"processing clip {idx} of {config['sample_count']}")
-
                 y = random_clip(all_audio, sr, config['sample_len'])
 
-                yt, _ = librosa.effects.trim(y)
+                if config['noise_reduction'] > .001:
+                    yt = nr.reduce_noise(y=y, sr=sr, stationary=True, prop_decrease=config['noise_reduction'])
+                else:
+                    yt = y
+
+                yt, _ = librosa.effects.trim(yt)
 
                 if idx % 8 == 0:
                     imgpath = os.path.join(test_bucket, "{}{}.jpg".format(label, str(idx).zfill(6)))
                 else:
                     imgpath = os.path.join(train_bucket, "{}{}.jpg".format(label, str(idx).zfill(6)))
 
-                #print(f"saving spectrogram to {imgpath}")
                 audio_to_image(imgpath, yt, sr)
 
             print("done", label)
         print("generated spectrograms!")
 
-    dls = ImageDataLoaders.from_folder(SPECTROGRAM_DIR_TRAIN, valid_pct=0.2, seed=42, num_workers=6)
+    dls = ImageDataLoaders.from_folder(SPECTROGRAM_DIR_TRAIN, valid_pct=0.2, seed=42, num_workers=6, bs=16)
     print(dls.vocab.o2i)
     learn = vision_learner(
         dls,
         models.resnet34,
+        normalize=False,
         loss_func=CrossEntropyLossFlat(),
         metrics=accuracy,
         path=config['model_path'],
-        model_dir=os.path.split(config['model_path'])[0]
+        model_dir=config['model_dir']
     )
 
     print("LEARNING!")
@@ -199,16 +203,22 @@ def train(args):
 
     plt.show()
     learn.freeze()
-    learn.export(config['model_path'])
+    learn.export(config['model_export_path'])
 
 
-DEFAULT_EMOTES = {"neutral": 1, "excited": 0, "sad": 0}
+#DEFAULT_EMOTES = {"neutral": 1, "excited": 0, "laugh": 0}
 
 
-def wav2imgdata(wav: File):
+
+def wav2imgdata(wav: File, nrfactor: float):
     with SimpleTimer("- processing"):
         y, sr = librosa.load(wav)
-        yt,_=librosa.effects.trim(y)
+        if nrfactor > .001:
+            yt = nr.reduce_noise(y=y, sr=sr, stationary=True, prop_decrease=nrfactor)
+        else:
+            yt = y
+
+        yt,_=librosa.effects.trim(yt)
 
         # Converting the sound clips into a melspectogram with librosa
         # A mel spectrogram is a spectrogram where the frequencies are converted to the mel scale
@@ -238,6 +248,39 @@ def wav2imgdata(wav: File):
     return img, power
 
 
+# def old_interpret_scores(window, weights, weight, db, emotes):
+#     sum_weights = sum(list(weights))
+#     print(sum_weights)
+
+#     smooth_emotes = {
+#         k: sum([
+#             d[k] * w
+#             for d, w
+#             in zip(list(window), list(weights))
+#         ]) / (sum_weights + 5)
+#         for k
+#         in emotes.keys()
+#     }
+#     print(emotes, smooth_emotes, weight, db)
+
+#     highest = max(smooth_emotes, key=smooth_emotes.get)
+
+#     NEUTRAL = {"HappyHigh": .01, "HappyLow": .01, "NegativeHigh": .01, "NegativeLow": .01}
+#     EXCITED = {"HappyHigh": .9, "HappyLow": .01, "NegativeHigh": .01, "NegativeLow": .01}
+#     SAD = {"HappyHigh": .01, "HappyLow": .01, "NegativeHigh": .01, "NegativeLow": .9}
+
+#     if sum_weights < 5 or weight < 0.1:
+#         return NEUTRAL
+#     elif highest == "excited":
+#         return EXCITED
+#     elif smooth_emotes["sad"] > 0.85:
+#         return SAD
+#     elif smooth_emotes["excited"] > .2:
+#         return EXCITED
+#     else:
+#         return NEUTRAL
+
+
 def interpret_scores(window, weights, weight, db, emotes):
     sum_weights = sum(list(weights))
     print(sum_weights)
@@ -251,46 +294,68 @@ def interpret_scores(window, weights, weight, db, emotes):
         for k
         in emotes.keys()
     }
-    print(emotes, smooth_emotes, weight, db)
-
+    for k, v in sorted(emotes.items()):
+        print("%s: %.3f | %.3f" % (k, v, (smooth_emotes[k])))
+    print(weight, sum_weights, db)
+    
     highest = max(smooth_emotes, key=smooth_emotes.get)
 
-    NEUTRAL = {"HappyHigh": .01, "HappyLow": .01, "NegativeHigh": .01, "NegativeLow": .01}
-    EXCITED = {"HappyHigh": .9, "HappyLow": .01, "NegativeHigh": .01, "NegativeLow": .01}
-    SAD = {"HappyHigh": .01, "HappyLow": .01, "NegativeHigh": .01, "NegativeLow": .9}
+    NEUTRAL = 0
+    EXCITED = 1
+    LAUGH = 2
+    REVERSE = {
+        NEUTRAL: "NEUTRAL",
+        EXCITED: "EXCITED",
+        LAUGH: "LAUGH"
+    }
+
+    emotion = NEUTRAL
+    weight = 0.9
 
     if sum_weights < 5 or weight < 0.1:
-        return NEUTRAL
+        emotion = NEUTRAL
+        weight = 0.9
     elif highest == "excited":
-        return EXCITED
-    elif smooth_emotes["sad"] > 0.85:
-        return SAD
-    elif smooth_emotes["excited"] > .2:
-        return EXCITED
+        emotion = EXCITED
+        weight = 0.9
+    elif smooth_emotes["laugh"] > 0.75 or (smooth_emotes["laugh"] > .3 and emotes["laugh"] > .9):
+        emotion = LAUGH
+        weight = 0.9
+    elif smooth_emotes["excited"] > .3:
+        emotion = EXCITED
+        weight = 0.9
     else:
-        return NEUTRAL
+        emotion = NEUTRAL
+        weight = 0.9
 
+    print(f"Sending Emotion: {emotion} ({REVERSE[emotion]}), Weight: {weight}")
 
-
+    return emotion, weight
+    
 
 
 def run(args):
     config = read_config(args.config)
     catsdir = os.path.join(config['tmp'], 'spectrograms_train')
-    dls = ImageDataLoaders.from_folder(catsdir, valid_pct=0.2, seed=42, num_workers=0)
+    dls = ImageDataLoaders.from_folder(catsdir, valid_pct=0.2, seed=42, num_workers=0, bs=16)
     print(dls.vocab.o2i)
     print(dls.vocab)
     model = vision_learner(
         dls,
         models.resnet34,
+        normalize=False,
         loss_func=CrossEntropyLossFlat(),
         metrics=accuracy,
         path=config['model_path'],
-        model_dir=os.path.split(config['model_path'])[0]
+        model_dir=config['model_dir']
     )
-    #model.load(config['model_path'])
-
     print("Model loaded")
+
+    DEFAULT_EMOTES = {
+        v: int(k == 0)
+        for k, v
+        in config['labels'].items()
+    }
 
     osc = Osc('127.0.0.1', args.port)
     print("OSC connected")
@@ -307,19 +372,10 @@ def run(args):
 
     while(True):
         with record_wav(config['sample_len'], config['fs']) as wav:
-            in_data, rms = wav2imgdata(wav)
+            in_data, rms = wav2imgdata(wav, config['noise_reduction'])
             with SimpleTimer('- predicting'):
                 label, tn, probs = model.predict(in_data)
             probs = list(probs)
-            #print(rms, probs)
-            #limit = 1 - (float(probs[EMOTIONS.CALM.value]) + float(probs[EMOTIONS.NEUTRAL.value])) / 2
-            
-            # emotes = {
-            #     "Happy": get_raw_happy(probs, limit),
-            #     "Angry": get_raw_angry(probs, limit),
-            #     "Shock": get_raw_shock(probs, limit),
-            #     "Sad": get_raw_sad(probs, limit)
-            # }
 
             emotes = {
                 k: float(probs[dls.vocab.o2i[k]])
@@ -328,65 +384,17 @@ def run(args):
             }
 
             db = 10 * np.log10(rms)
-            weight = max(db - (-23), 0)
-            #print(emotes, weight, db)
+            weight = max(db - (-23), 0) 
+
             if weight < 1:
                 emotes = DEFAULT_EMOTES
 
             window.append(emotes)
             weights.append(weight)
 
-            # sum_weights = sum(list(weights))
-            # #for scores, weights in zip(list(window), list(weights)):
-
-            # smooth_emotes = {
-            #     k: sum([
-            #         d[k] * w
-            #         for d, w
-            #         in zip(list(window), list(weights))
-            #     ]) / (sum_weights + 5)
-            #     for k
-            #     in emotes.keys()
-            # }
-            # print(window)
-            # print(weights)
-            # print(smooth_emotes)
-
-            result = interpret_scores(window, weights, weight, db, emotes)
-
-            with SimpleTimer("- transmitting"):
-                for k, v in result.items():
-                    print(f"sending {k} = {v}")
-                    osc.send_message(f"{config['paramprefix']}{k}", v)
-
-
-            continue
-            happy = smooth_emotes["Happy"]
-            angry = smooth_emotes["Angry"]
-            shock = smooth_emotes["Shock"]
-            sad = smooth_emotes["Sad"]
-            # happy = max(smooth_emotes["Happy"] - smooth_emotes["Angry"], 0) + 0.001
-            # angry = max(smooth_emotes["Angry"] - smooth_emotes["Happy"], 0) + 0.001
-            # shock = max(smooth_emotes["Shock"] - max(happy, angry), 0) + 0.001
-            # sad = max(smooth_emotes["Sad"] - max(happy, angry), 0) + 0.001
-
-            with SimpleTimer("- transmitting"):
-                print(f"sending {happy}")
-                #osc.send_message(f"{args.paramprefix}Happy", happy * 1.65 + .001)
-                osc.send_message(f"{args.paramprefix}HappyHigh", happy * 1.65 + .001)
-                time.sleep(1/20)
-                print(f"sending {angry}")
-                #osc.send_message(f"{args.paramprefix}Angry", .001)
-                osc.send_message(f"{args.paramprefix}HappyLow", .001)
-                time.sleep(1/20)
-                print(f"sending {shock}")
-                #osc.send_message(f"{args.paramprefix}Shock", shock * .8 + .001)
-                osc.send_message(f"{args.paramprefix}NegativeHigh", shock * .8 + .001)
-                time.sleep(1/20)
-                print(f"sending {sad}")
-                #osc.send_message(f"{args.paramprefix}Sad", sad * 1.0 + .001)
-                osc.send_message(f"{args.paramprefix}NegativeLow", sad * 1.2 + .001)
-                time.sleep(1/20)
+            emotion, emotion_weight = interpret_scores(window, weights, weight, db, emotes)
+            osc.send_message(f"{config['paramprefix']}Emotion", emotion)
+            osc.send_message(f"{config['paramprefix']}EmotionWeight", emotion_weight + .001)
 
 
 def main():
